@@ -10,7 +10,6 @@ LOTUS_PATH:=./extern/lotus/
 TARGET=./sealer-recover
 
 build-deps:
-	git submodule update --init --recursive
 	make -C ${LOTUS_PATH} deps
 
 build: build-deps
