@@ -3,3 +3,4 @@
 go.sum
 extern
 sealer-recover
+*.json
