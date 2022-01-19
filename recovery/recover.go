@@ -11,20 +11,22 @@ import (
 	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper/basicfs"
 	sealing "github.com/filecoin-project/lotus/extern/storage-sealing"
 	"github.com/filecoin-project/specs-storage/storage"
-	"github.com/roc-daniel/filecoin-sealer-recover/export"
+	"github.com/ipfs/go-datastore"
+	leveldb "github.com/ipfs/go-ds-leveldb"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/mitchellh/go-homedir"
+	"github.com/roc-daniel/filecoin-sealer-recover/export"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 	"io/ioutil"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 var log = logging.Logger("recover")
+var db *leveldb.Datastore
 
 var RecoverCmd = &cli.Command{
 	Name:      "recover",
@@ -44,12 +46,12 @@ var RecoverCmd = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name:  "sealing-result",
-			Value: "~/sector",
+			Value: "./sector",
 			Usage: "Recover sector result path",
 		},
 		&cli.StringFlag{
 			Name:  "sealing-temp",
-			Value: "~/temp",
+			Value: "./temp",
 			Usage: "Temporarily generated during sector file",
 		},
 	},
@@ -60,18 +62,9 @@ var RecoverCmd = &cli.Command{
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		if cctx.Args().Len() < 1 {
-			return fmt.Errorf("at least one sector must be specified")
-		}
-
-		cmdSectors := make([]uint64, 0)
-		for _, sn := range cctx.Args().Slice() {
-			sectorNum, err := strconv.ParseUint(sn, 10, 64)
-			if err != nil {
-				return fmt.Errorf("could not parse sector number: %w", err)
-			}
-			cmdSectors = append(cmdSectors, sectorNum)
-		}
+		//if cctx.Args().Len() < 1 {
+		//	return fmt.Errorf("at least one sector must be specified")
+		//}
 
 		pssb := cctx.String("sectors-recovery-metadata")
 		if pssb == "" {
@@ -85,22 +78,58 @@ var RecoverCmd = &cli.Command{
 			return xerrors.Errorf("migrating sectors metadata: %w", err)
 		}
 
+		//cmdSectors := make([]uint64, 0)
+		//for _, sn := range cctx.Args().Slice() {
+		//	sectorNum, err := strconv.ParseUint(sn, 10, 64)
+		//	if err != nil {
+		//		return fmt.Errorf("could not parse sector number: %w", err)
+		//	}
+		//	cmdSectors = append(cmdSectors, sectorNum)
+		//}
+
+		fs, err := homedir.Expand("data")
+		if err != nil {
+			return xerrors.Errorf("get homedir: %v", err)
+		}
+		db, err = leveldb.NewDatastore(fs, nil)
+		if err != nil {
+			return xerrors.Errorf("get data: %v", err)
+		}
+		defer db.Close()
+
 		skipSectors := make([]uint64, 0)
 		runSectors := make([]uint64, 0)
 		sectorInfos := make(export.SectorInfos, 0)
-		for _, sn := range cmdSectors {
-			run := false
-			for _, sectorInfo := range rp.SectorInfos {
-				if sn == uint64(sectorInfo.SectorNumber) {
-					run = true
-					sectorInfos = append(sectorInfos, sectorInfo)
-					runSectors = append(runSectors, sn)
-				}
+
+		for _, sectorInfo := range rp.SectorInfos {
+			key := fmt.Sprintf("pc2-%s", sectorInfo.SectorNumber.String())
+			b, err := db.Has(datastore.NewKey(key))
+			if err != nil {
+				return xerrors.Errorf("get key: %s, %v", key, err)
 			}
-			if !run {
-				skipSectors = append(skipSectors, sn)
+
+			if !b {
+				sectorInfos = append(sectorInfos, sectorInfo)
+				runSectors = append(runSectors, uint64(sectorInfo.SectorNumber))
+			} else {
+				skipSectors = append(skipSectors, uint64(sectorInfo.SectorNumber))
 			}
 		}
+
+		//for _, sn := range cmdSectors {
+		//	run := false
+		//	for _, sectorInfo := range rp.SectorInfos {
+		//		if sn == uint64(sectorInfo.SectorNumber) {
+		//			run = true
+		//			sectorInfos = append(sectorInfos, sectorInfo)
+		//			runSectors = append(runSectors, sn)
+		//		}
+		//	}
+		//	if !run {
+		//		skipSectors = append(skipSectors, sn)
+		//	}
+		//}
+
 		if len(runSectors) > 0 {
 			log.Infof("Sector %v to be recovered, %d in total!", runSectors, len(runSectors))
 		}
@@ -113,6 +142,7 @@ var RecoverCmd = &cli.Command{
 		if err = RecoverSealedFile(ctx, rp, cctx.Uint("parallel"), cctx.String("sealing-result"), cctx.String("sealing-temp")); err != nil {
 			return err
 		}
+
 		log.Info("Complete recovery sealed!")
 		return nil
 	},
@@ -146,10 +176,18 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 	wg := &sync.WaitGroup{}
 	limiter := make(chan bool, parallel)
 	var p1LastTaskTime time.Time
+
 	for _, sector := range rp.SectorInfos {
+		key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
+		b, err := db.Has(datastore.NewKey(key))
+		if err != nil {
+			log.Errorf("Sector (%d) , has pc1o error: %v", sector.SectorNumber, err)
+		}
+
 		wg.Add(1)
 		limiter <- true
-		go func(sector *export.SectorInfo) {
+
+		go func(sector *export.SectorInfo, b bool) {
 			defer func() {
 				wg.Done()
 				<-limiter
@@ -157,7 +195,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 
 			//Control PC1 running interval
 			for {
-				if time.Now().Add(-time.Minute * 10).After(p1LastTaskTime) {
+				if time.Now().Add(-time.Minute * 2).After(p1LastTaskTime) {
 					break
 				}
 				<-time.After(p1LastTaskTime.Sub(time.Now()))
@@ -193,21 +231,40 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 
 			log.Infof("Start recover sector(%d,%d), registeredSealProof: %d, ticket: %x", actorID, sector.SectorNumber, sector.SealProof, sector.Ticket)
 
-			log.Infof("Start running AP, sector (%d)", sector.SectorNumber)
-			pi, err := sb.AddPiece(context.TODO(), sid, nil, abi.PaddedPieceSize(rp.SectorSize).Unpadded(), sealing.NewNullReader(abi.UnpaddedPieceSize(rp.SectorSize)))
-			if err != nil {
-				log.Errorf("Sector (%d) ,running AP  error: %v", sector.SectorNumber, err)
-			}
-			var pieces []abi.PieceInfo
-			pieces = append(pieces, pi)
-			log.Infof("Complete AP, sector (%d)", sector.SectorNumber)
+			var pc1o storage.PreCommit1Out
+			if !b {
+				log.Infof("Start running AP, sector (%d)", sector.SectorNumber)
 
-			log.Infof("Start running PreCommit1, sector (%d)", sector.SectorNumber)
-			pc1o, err := sb.SealPreCommit1(context.TODO(), sid, abi.SealRandomness(sector.Ticket), []abi.PieceInfo{pi})
-			if err != nil {
-				log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
+				pi, err := sb.AddPiece(context.TODO(), sid, nil, abi.PaddedPieceSize(rp.SectorSize).Unpadded(), sealing.NewNullReader(abi.UnpaddedPieceSize(rp.SectorSize)))
+				if err != nil {
+					log.Errorf("Sector (%d) ,running AP  error: %v", sector.SectorNumber, err)
+				}
+				var pieces []abi.PieceInfo
+				pieces = append(pieces, pi)
+
+				log.Infof("Complete AP, sector (%d)", sector.SectorNumber)
+
+				log.Infof("Start running PreCommit1, sector (%d)", sector.SectorNumber)
+
+				pc1o, err = sb.SealPreCommit1(context.TODO(), sid, abi.SealRandomness(sector.Ticket), []abi.PieceInfo{pi})
+				if err != nil {
+					log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
+				}
+
+				log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
+
+				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
+				err = db.Put(datastore.NewKey(key), pc1o)
+				if err != nil {
+					log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
+				}
+			} else {
+				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
+				pc1o, err = db.Get(datastore.NewKey(key))
+				if err != nil {
+					log.Errorf("Sector (%d) , get pc1o error: %v", sector.SectorNumber, err)
+				}
 			}
-			log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
 
 			err = sealPreCommit2AndCheck(ctx, sb, sid, pc1o, sector.SealedCID.String())
 			if err != nil {
@@ -219,8 +276,14 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				log.Errorf("Sector (%d) , running MoveStorage  error: %v", sector.SectorNumber, err)
 			}
 
+			key := fmt.Sprintf("pc2-%s", sector.SectorNumber.String())
+			err = db.Put(datastore.NewKey(key), []byte("success"))
+			if err != nil {
+				log.Errorf("Sector (%d) , put pc2 error: %v", sector.SectorNumber, err)
+			}
+
 			log.Infof("Complete sector (%d)", sector.SectorNumber)
-		}(sector)
+		}(sector, b)
 	}
 	wg.Wait()
 
