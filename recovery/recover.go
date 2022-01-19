@@ -229,20 +229,24 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 			sdir, err := homedir.Expand(sealingTemp)
 			if err != nil {
 				log.Errorf("Sector (%d) ,expands the path error: %v", sector.SectorNumber, err)
+				return
 			}
 			mkdirAll(sdir)
 			tempDir, err := ioutil.TempDir(sdir, fmt.Sprintf("recover-%d", sector.SectorNumber))
 			if err != nil {
 				log.Errorf("Sector (%d) ,creates a new temporary directory error: %v", sector.SectorNumber, err)
+				return
 			}
 			if err := os.MkdirAll(tempDir, 0775); err != nil {
 				log.Errorf("Sector (%d) ,creates a directory named path error: %v", sector.SectorNumber, err)
+				return
 			}
 			sb, err := ffiwrapper.New(&basicfs.Provider{
 				Root: tempDir,
 			})
 			if err != nil {
 				log.Errorf("Sector (%d) ,new ffi Sealer error: %v", sector.SectorNumber, err)
+				return
 			}
 
 			sid := storage.SectorRef{
@@ -262,6 +266,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				pi, err := sb.AddPiece(context.TODO(), sid, nil, abi.PaddedPieceSize(rp.SectorSize).Unpadded(), sealing.NewNullReader(abi.UnpaddedPieceSize(rp.SectorSize)))
 				if err != nil {
 					log.Errorf("Sector (%d) ,running AP  error: %v", sector.SectorNumber, err)
+					return
 				}
 				var pieces []abi.PieceInfo
 				pieces = append(pieces, pi)
@@ -273,6 +278,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				pc1o, err = sb.SealPreCommit1(context.TODO(), sid, abi.SealRandomness(sector.Ticket), []abi.PieceInfo{pi})
 				if err != nil {
 					log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
+					return
 				}
 				//time.Sleep(time.Minute * 5)
 
@@ -288,6 +294,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				pc1o, err = db.Get(datastore.NewKey(key))
 				if err != nil {
 					log.Errorf("Sector (%d) , get pc1o error: %v", sector.SectorNumber, err)
+					return
 				}
 				log.Infof("Have Completed PreCommit1, sector (%d)", sector.SectorNumber)
 			}
@@ -338,11 +345,13 @@ func HandlePreCommit2() {
 			err := sealPreCommit2AndCheck(ctx, p.Sb, p.Sid, p.Phase1Out, p.SealedCID)
 			if err != nil {
 				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+				continue
 			}
 
 			err = MoveStorage(ctx, p.Sid, p.TempDir, p.SealingResult)
 			if err != nil {
 				log.Errorf("Sector (%d) , running MoveStorage  error: %v", number, err)
+				continue
 			}
 
 			//time.Sleep(time.Minute)
