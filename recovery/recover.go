@@ -20,13 +20,26 @@ import (
 	"golang.org/x/xerrors"
 	"io/ioutil"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var log = logging.Logger("recover")
 var db *leveldb.Datastore
+
+type PreCommitParam struct {
+	Sb            *ffiwrapper.Sealer
+	Sid           storage.SectorRef
+	Phase1Out     storage.PreCommit1Out
+	SealedCID     string
+	TempDir       string
+	SealingResult string
+}
+
+var paramChannel chan *PreCommitParam
 
 var RecoverCmd = &cli.Command{
 	Name:      "recover",
@@ -134,16 +147,27 @@ var RecoverCmd = &cli.Command{
 			log.Infof("Sector %v to be recovered, %d in total!", runSectors, len(runSectors))
 		}
 		if len(skipSectors) > 0 {
-			log.Warnf("Skip sector %v, %d in total, because sector information was not found in the metadata file!", skipSectors, len(skipSectors))
+			log.Warnf("Skip sector %v, %d in total, because sector has compeleted sealed!", skipSectors, len(skipSectors))
 		}
 
 		rp.SectorInfos = sectorInfos
+
+		paramChannel = make(chan *PreCommitParam, 13)
+		go HandlePreCommit2()
 
 		if err = RecoverSealedFile(ctx, rp, cctx.Uint("parallel"), cctx.String("sealing-result"), cctx.String("sealing-temp")); err != nil {
 			return err
 		}
 
-		log.Info("Complete recovery sealed!")
+		log.Info("Complete recovery sealed， waiting pc2")
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+		<-sigs
+		close(paramChannel)
+
+		log.Info("Complete pc2 sealed")
+
 		return nil
 	},
 }
@@ -195,7 +219,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 
 			//Control PC1 running interval
 			for {
-				if time.Now().Add(-time.Minute * 2).After(p1LastTaskTime) {
+				if time.Now().Add(-time.Minute * 3).After(p1LastTaskTime) {
 					break
 				}
 				<-time.After(p1LastTaskTime.Sub(time.Now()))
@@ -250,6 +274,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				if err != nil {
 					log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
 				}
+				//time.Sleep(time.Minute * 5)
 
 				log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
 
@@ -264,25 +289,36 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				if err != nil {
 					log.Errorf("Sector (%d) , get pc1o error: %v", sector.SectorNumber, err)
 				}
+				log.Infof("Have Completed PreCommit1, sector (%d)", sector.SectorNumber)
 			}
 
-			err = sealPreCommit2AndCheck(ctx, sb, sid, pc1o, sector.SealedCID.String())
-			if err != nil {
-				log.Errorf("Sector (%d) , running PreCommit2  error: %v", sector.SectorNumber, err)
+			p := &PreCommitParam{
+				Sb:            sb,
+				Sid:           sid,
+				Phase1Out:     pc1o,
+				SealedCID:     sector.SealedCID.String(),
+				TempDir:       tempDir,
+				SealingResult: sealingResult,
 			}
+			paramChannel <- p
 
-			err = MoveStorage(ctx, sid, tempDir, sealingResult)
-			if err != nil {
-				log.Errorf("Sector (%d) , running MoveStorage  error: %v", sector.SectorNumber, err)
-			}
-
-			key := fmt.Sprintf("pc2-%s", sector.SectorNumber.String())
-			err = db.Put(datastore.NewKey(key), []byte("success"))
-			if err != nil {
-				log.Errorf("Sector (%d) , put pc2 error: %v", sector.SectorNumber, err)
-			}
-
-			log.Infof("Complete sector (%d)", sector.SectorNumber)
+			//err = sealPreCommit2AndCheck(ctx, sb, sid, pc1o, sector.SealedCID.String())
+			//if err != nil {
+			//	log.Errorf("Sector (%d) , running PreCommit2  error: %v", sector.SectorNumber, err)
+			//}
+			//
+			//err = MoveStorage(ctx, sid, tempDir, sealingResult)
+			//if err != nil {
+			//	log.Errorf("Sector (%d) , running MoveStorage  error: %v", sector.SectorNumber, err)
+			//}
+			//
+			//key := fmt.Sprintf("pc2-%s", sector.SectorNumber.String())
+			//err = db.Put(datastore.NewKey(key), []byte("success"))
+			//if err != nil {
+			//	log.Errorf("Sector (%d) , put pc2 error: %v", sector.SectorNumber, err)
+			//}
+			//
+			//log.Infof("Complete sector (%d)", sector.SectorNumber)
 		}(sector, b)
 	}
 	wg.Wait()
@@ -290,18 +326,48 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 	return nil
 }
 
-var pc2Lock sync.Mutex
+func HandlePreCommit2() {
+	for {
+		select {
+		case p := <-paramChannel:
+			number := p.Sid.ID.Number
+
+			log.Infof("Start running PreCommit2, sector (%d)", number)
+			ctx := context.Background()
+
+			err := sealPreCommit2AndCheck(ctx, p.Sb, p.Sid, p.Phase1Out, p.SealedCID)
+			if err != nil {
+				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+			}
+
+			err = MoveStorage(ctx, p.Sid, p.TempDir, p.SealingResult)
+			if err != nil {
+				log.Errorf("Sector (%d) , running MoveStorage  error: %v", number, err)
+			}
+
+			//time.Sleep(time.Minute)
+
+			key := fmt.Sprintf("pc2-%s", number.String())
+			err = db.Put(datastore.NewKey(key), []byte("success"))
+			if err != nil {
+				log.Errorf("Sector (%d) , put pc2 error: %v", number, err)
+			}
+
+			log.Infof("Complete PreCommit2, sector (%d)", number)
+		}
+	}
+}
+
+//var pc2Lock sync.Mutex
 
 func sealPreCommit2AndCheck(ctx context.Context, sb *ffiwrapper.Sealer, sid storage.SectorRef, phase1Out storage.PreCommit1Out, sealedCID string) error {
-	pc2Lock.Lock()
-	log.Infof("Start running PreCommit2, sector (%d)", sid.ID)
-
+	//pc2Lock.Lock()
 	cids, err := sb.SealPreCommit2(ctx, sid, phase1Out)
 	if err != nil {
-		pc2Lock.Unlock()
+		//pc2Lock.Unlock()
 		return err
 	}
-	pc2Lock.Unlock()
+	//pc2Lock.Unlock()
 	log.Infof("Complete PreCommit2, sector (%d)", sid.ID)
 
 	//check CID with chain
