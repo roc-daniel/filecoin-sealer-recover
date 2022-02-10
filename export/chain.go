@@ -65,6 +65,8 @@ func GetSectorCommitInfoOnChain(ctx context.Context, fullNodeApi v0api.FullNode,
 		return ts, &preCommitInfo, err
 	}
 
+	fmt.Println(1)
+
 	h := new(http.Client)
 	url := fmt.Sprintf("https://filfox.info/api/v1/tipset/%d", si.Activation)
 	resp, err := h.Get(url)
@@ -86,6 +88,8 @@ func GetSectorCommitInfoOnChain(ctx context.Context, fullNodeApi v0api.FullNode,
 	}
 	//fmt.Println(tipSet)
 
+	fmt.Println(2)
+
 	//ts, err := fullNodeApi.ChainGetTipSetByHeight(ctx, si.Activation, types.EmptyTSK)
 	ts, err := fullNodeApi.ChainGetTipSetByHeight(ctx, si.Activation, tipSet)
 	if err != nil {
@@ -95,10 +99,14 @@ func GetSectorCommitInfoOnChain(ctx context.Context, fullNodeApi v0api.FullNode,
 		return nil, nil, xerrors.Errorf("Height(%d) Tipset Not Found", si.Activation)
 	}
 
+	fmt.Println(3)
+
 	preCommitInfo, err := fullNodeApi.StateSectorPreCommitInfo(ctx, maddr, sid, ts.Key())
 	if err != nil {
 		return nil, nil, xerrors.Errorf("Getting sector PreCommit info err:", err)
 	}
+
+	fmt.Println(4)
 
 	return ts, &preCommitInfo, err
 }
