@@ -30,11 +30,11 @@ var ExportsCmd = &cli.Command{
 			Required: true,
 		},
 		&cli.StringFlag{
-			Name:     "sector-numbers",
-			Usage:    "specify the sector numbers file for the sectors recovery",
+			Name:  "sector-numbers",
+			Usage: "specify the sector numbers file for the sectors recovery",
 		},
 		&cli.Int64Flag{
-			Name: "sector-count",
+			Name:  "sector-count",
 			Usage: "specify sector count per meta file",
 		},
 	},
@@ -129,6 +129,8 @@ var ExportsCmd = &cli.Command{
 			//	SectorNumber: abi.SectorNumber(sector),
 			//}
 			sectorInfos = append(sectorInfos, si)
+
+			fmt.Printf("finished sector %d\n", sector)
 
 			count++
 			if sectorCount != 0 && count >= sectorCount {
