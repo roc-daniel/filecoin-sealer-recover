@@ -282,12 +282,14 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				}
 				//time.Sleep(time.Minute * 5)
 
-				log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
+				if pc1o != nil && len(pc1o) > 0 {
+					log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
 
-				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
-				err = db.Put(datastore.NewKey(key), pc1o)
-				if err != nil {
-					log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
+					key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
+					err = db.Put(datastore.NewKey(key), pc1o)
+					if err != nil {
+						log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
+					}
 				}
 			} else {
 				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
@@ -376,6 +378,11 @@ func sealPreCommit2AndCheck(ctx context.Context, sb *ffiwrapper.Sealer, sid stor
 		//pc2Lock.Unlock()
 		return err
 	}
+
+	if cids.Sealed.String() == "" {
+		return xerrors.Errorf("sealed cid %s", cids.Sealed.String())
+	}
+
 	//pc2Lock.Unlock()
 	log.Infof("Complete PreCommit2, sector (%d)", sid.ID)
 
