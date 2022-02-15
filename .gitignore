@@ -5,3 +5,4 @@ extern
 sealer-recover
 *.json
 data
+temp

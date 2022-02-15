@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -232,7 +233,8 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 				return
 			}
 			mkdirAll(sdir)
-			tempDir, err := ioutil.TempDir(sdir, fmt.Sprintf("recover-%d", sector.SectorNumber))
+			//tempDir, err := ioutil.TempDir(sdir, fmt.Sprintf("recover-%d", sector.SectorNumber))
+			tempDir := path.Join(sdir, fmt.Sprintf("recover-%d", sector.SectorNumber))
 			if err != nil {
 				log.Errorf("Sector (%d) ,creates a new temporary directory error: %v", sector.SectorNumber, err)
 				return
