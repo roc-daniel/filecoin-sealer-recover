@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 
 var log = logging.Logger("recover")
 var db *leveldb.Datastore
+var errorSectorFile *os.File
 
 type PreCommitParam struct {
 	Sb            *ffiwrapper.Sealer
@@ -110,6 +112,17 @@ var RecoverCmd = &cli.Command{
 			return xerrors.Errorf("get data: %v", err)
 		}
 		defer db.Close()
+
+		errorSector, err := homedir.Expand("error-sector.txt")
+		if err != nil {
+			return xerrors.Errorf("get homedir: %v", err)
+		}
+
+		errorSectorFile, err = os.OpenFile(errorSector, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			return xerrors.Errorf("open file: %v", err)
+		}
+		defer errorSectorFile.Close()
 
 		skipSectors := make([]uint64, 0)
 		runSectors := make([]uint64, 0)
@@ -282,17 +295,19 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 					log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
 					return
 				}
-				//time.Sleep(time.Minute * 5)
-
-				if pc1o != nil && len(pc1o) > 0 {
-					log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
-
-					key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
-					err = db.Put(datastore.NewKey(key), pc1o)
-					if err != nil {
-						log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
-					}
+				if pc1o == nil || len(pc1o) <= 0 {
+					//restart
+					return
 				}
+
+				log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
+
+				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
+				err = db.Put(datastore.NewKey(key), pc1o)
+				if err != nil {
+					log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
+				}
+
 			} else {
 				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
 				pc1o, err = db.Get(datastore.NewKey(key))
@@ -346,9 +361,33 @@ func HandlePreCommit2() {
 			log.Infof("Start running PreCommit2, sector (%d)", number)
 			ctx := context.Background()
 
-			err := sealPreCommit2AndCheck(ctx, p.Sb, p.Sid, p.Phase1Out, p.SealedCID)
+			//err := sealPreCommit2AndCheck(ctx, p.Sb, p.Sid, p.Phase1Out, p.SealedCID)
+			//if err != nil {
+			//	log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+			//	continue
+			//}
+
+			cids, err := p.Sb.SealPreCommit2(ctx, p.Sid, p.Phase1Out)
 			if err != nil {
 				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+				_ = os.RemoveAll(p.TempDir)
+				WriteErrorSector(p.Sid.ID.Number.String())
+				continue
+			}
+
+			if cids.Sealed.String() == "" {
+				//restart
+				continue
+			}
+
+			log.Infof("Complete PreCommit2, sector (%d)", p.Sid.ID)
+
+			//check CID with chain
+			if p.SealedCID != cids.Sealed.String() {
+				err := xerrors.Errorf("sealed cid mismatching!!! (sealedCID: %v, newSealedCID: %v)", p.SealedCID, cids.Sealed.String())
+				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+				_ = os.RemoveAll(p.TempDir)
+				WriteErrorSector(p.Sid.ID.Number.String())
 				continue
 			}
 
@@ -357,8 +396,6 @@ func HandlePreCommit2() {
 				log.Errorf("Sector (%d) , running MoveStorage  error: %v", number, err)
 				continue
 			}
-
-			//time.Sleep(time.Minute)
 
 			key := fmt.Sprintf("pc2-%s", number.String())
 			err = db.Put(datastore.NewKey(key), []byte("success"))
@@ -369,6 +406,12 @@ func HandlePreCommit2() {
 			log.Infof("Complete PreCommit2, sector (%d)", number)
 		}
 	}
+}
+
+func WriteErrorSector(sectorId string) {
+	write := bufio.NewWriter(errorSectorFile)
+	write.WriteString(sectorId + "\r\n")
+	write.Flush()
 }
 
 //var pc2Lock sync.Mutex

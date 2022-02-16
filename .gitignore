@@ -6,3 +6,4 @@ sealer-recover
 *.json
 data
 temp
+error-sector.txt
