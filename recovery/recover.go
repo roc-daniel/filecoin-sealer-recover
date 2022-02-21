@@ -371,7 +371,7 @@ func HandlePreCommit2() {
 			if err != nil {
 				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
 				_ = os.RemoveAll(p.TempDir)
-				WriteErrorSector(p.Sid.ID.Number.String())
+				WriteErrorSector(p.Sid.ID.Number.String(), err.Error())
 				continue
 			}
 
@@ -387,7 +387,7 @@ func HandlePreCommit2() {
 				err := xerrors.Errorf("sealed cid mismatching!!! (sealedCID: %v, newSealedCID: %v)", p.SealedCID, cids.Sealed.String())
 				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
 				_ = os.RemoveAll(p.TempDir)
-				WriteErrorSector(p.Sid.ID.Number.String())
+				WriteErrorSector(p.Sid.ID.Number.String(), "mismatching")
 				continue
 			}
 
@@ -408,9 +408,9 @@ func HandlePreCommit2() {
 	}
 }
 
-func WriteErrorSector(sectorId string) {
+func WriteErrorSector(sectorId string, reason string) {
 	write := bufio.NewWriter(errorSectorFile)
-	write.WriteString(sectorId + "\r\n")
+	write.WriteString(sectorId + "-" + reason + "\r\n")
 	write.Flush()
 }
 
