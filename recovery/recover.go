@@ -12,8 +12,7 @@ import (
 	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper/basicfs"
 	sealing "github.com/filecoin-project/lotus/extern/storage-sealing"
 	"github.com/filecoin-project/specs-storage/storage"
-	"github.com/ipfs/go-datastore"
-	leveldb "github.com/ipfs/go-ds-leveldb"
+	"github.com/go-redis/redis/v8"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/mitchellh/go-homedir"
 	"github.com/roc-daniel/filecoin-sealer-recover/export"
@@ -30,19 +29,24 @@ import (
 )
 
 var log = logging.Logger("recover")
-var db *leveldb.Datastore
+
+//var db *leveldb.Datastore
 var errorSectorFile *os.File
+var redisDB *redis.Client
+var closing bool
+var done chan bool
+
+const PC1_RESULT_KEY = "pc1-result"
+const PC2_RESULT_KEY = "pc2-result"
+const PC2_COMPUTING_TMEP_KEY = "pc2-computing-temp"
+const QUEUE_KEY = "queue"
 
 type PreCommitParam struct {
-	Sb            *ffiwrapper.Sealer
-	Sid           storage.SectorRef
-	Phase1Out     storage.PreCommit1Out
-	SealedCID     string
-	TempDir       string
-	SealingResult string
+	SectorInfo export.SectorInfo
+	Phase1Out  []byte
 }
 
-var paramChannel chan *PreCommitParam
+//var paramChannel chan *PreCommitParam
 
 var RecoverCmd = &cli.Command{
 	Name:      "recover",
@@ -70,6 +74,16 @@ var RecoverCmd = &cli.Command{
 			Value: "./temp",
 			Usage: "Temporarily generated during sector file",
 		},
+		&cli.BoolFlag{
+			Name:  "precommit1",
+			Value: true,
+			Usage: "enable precommit1 (32G sectors: 1 core, 128GiB Memory)",
+		},
+		&cli.BoolFlag{
+			Name:  "precommit2",
+			Value: true,
+			Usage: "enable precommit2 (32G sectors: all cores, 96GiB Memory)",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		log.Info("Start sealer recovery!")
@@ -77,10 +91,6 @@ var RecoverCmd = &cli.Command{
 		ctx := cliutil.DaemonContext(cctx)
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
-
-		//if cctx.Args().Len() < 1 {
-		//	return fmt.Errorf("at least one sector must be specified")
-		//}
 
 		pssb := cctx.String("sectors-recovery-metadata")
 		if pssb == "" {
@@ -94,93 +104,75 @@ var RecoverCmd = &cli.Command{
 			return xerrors.Errorf("migrating sectors metadata: %w", err)
 		}
 
-		//cmdSectors := make([]uint64, 0)
-		//for _, sn := range cctx.Args().Slice() {
-		//	sectorNum, err := strconv.ParseUint(sn, 10, 64)
-		//	if err != nil {
-		//		return fmt.Errorf("could not parse sector number: %w", err)
-		//	}
-		//	cmdSectors = append(cmdSectors, sectorNum)
-		//}
+		redisDB = redis.NewClient(&redis.Options{
+			Addr: "localhost:6379",
+			DB:   0,
+		})
+		defer redisDB.Close()
 
-		fs, err := homedir.Expand("data")
-		if err != nil {
-			return xerrors.Errorf("get homedir: %v", err)
-		}
-		db, err = leveldb.NewDatastore(fs, nil)
-		if err != nil {
-			return xerrors.Errorf("get data: %v", err)
-		}
-		defer db.Close()
-
-		errorSector, err := homedir.Expand("error-sector.txt")
-		if err != nil {
-			return xerrors.Errorf("get homedir: %v", err)
+		cmd := redisDB.Ping(ctx)
+		if cmd.Err() != nil {
+			return xerrors.Errorf("connect redis: %v", cmd.Err())
 		}
 
-		errorSectorFile, err = os.OpenFile(errorSector, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			return xerrors.Errorf("open file: %v", err)
-		}
-		defer errorSectorFile.Close()
+		done = make(chan bool, 1)
 
-		skipSectors := make([]uint64, 0)
-		runSectors := make([]uint64, 0)
-		sectorInfos := make(export.SectorInfos, 0)
+		if cctx.Bool("precommit1") {
+			skipSectors := make([]uint64, 0)
+			runSectors := make([]uint64, 0)
+			sectorInfos := make(export.SectorInfos, 0)
 
-		for _, sectorInfo := range rp.SectorInfos {
-			key := fmt.Sprintf("pc2-%s", sectorInfo.SectorNumber.String())
-			b, err := db.Has(datastore.NewKey(key))
+			for _, sectorInfo := range rp.SectorInfos {
+				b, err := redisDB.HExists(ctx, PC2_RESULT_KEY, sectorInfo.SectorNumber.String()).Result()
+				if err != nil && err != redis.Nil {
+					return xerrors.Errorf("get key: %s, %v", sectorInfo.SectorNumber.String(), err)
+				}
+
+				if !b {
+					sectorInfos = append(sectorInfos, sectorInfo)
+					runSectors = append(runSectors, uint64(sectorInfo.SectorNumber))
+				} else {
+					skipSectors = append(skipSectors, uint64(sectorInfo.SectorNumber))
+				}
+			}
+
+			if len(runSectors) > 0 {
+				log.Infof("Sector %v to be recovered, %d in total!", runSectors, len(runSectors))
+			}
+			if len(skipSectors) > 0 {
+				log.Warnf("Skip sector %v, %d in total, because sector has compeleted sealed!", skipSectors, len(skipSectors))
+			}
+
+			rp.SectorInfos = sectorInfos
+
+			go RecoverPC1SealedFile(ctx, rp, cctx.Uint("parallel"), cctx.String("sealing-temp"))
+
+		} else if cctx.Bool("precommit2") {
+			errorSector, err := homedir.Expand("error-sector.txt")
 			if err != nil {
-				return xerrors.Errorf("get key: %s, %v", key, err)
+				return xerrors.Errorf("get homedir: %v", err)
 			}
 
-			if !b {
-				sectorInfos = append(sectorInfos, sectorInfo)
-				runSectors = append(runSectors, uint64(sectorInfo.SectorNumber))
-			} else {
-				skipSectors = append(skipSectors, uint64(sectorInfo.SectorNumber))
+			errorSectorFile, err = os.OpenFile(errorSector, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+			if err != nil {
+				cancel()
+				return xerrors.Errorf("open file: %v", err)
 			}
+			defer errorSectorFile.Close()
+
+			go RecoverPC2SealedFile(ctx, rp, cctx.String("sealing-result"), cctx.String("sealing-temp"))
 		}
 
-		//for _, sn := range cmdSectors {
-		//	run := false
-		//	for _, sectorInfo := range rp.SectorInfos {
-		//		if sn == uint64(sectorInfo.SectorNumber) {
-		//			run = true
-		//			sectorInfos = append(sectorInfos, sectorInfo)
-		//			runSectors = append(runSectors, sn)
-		//		}
-		//	}
-		//	if !run {
-		//		skipSectors = append(skipSectors, sn)
-		//	}
-		//}
-
-		if len(runSectors) > 0 {
-			log.Infof("Sector %v to be recovered, %d in total!", runSectors, len(runSectors))
-		}
-		if len(skipSectors) > 0 {
-			log.Warnf("Skip sector %v, %d in total, because sector has compeleted sealed!", skipSectors, len(skipSectors))
-		}
-
-		rp.SectorInfos = sectorInfos
-
-		paramChannel = make(chan *PreCommitParam, 13)
-		go HandlePreCommit2()
-
-		if err = RecoverSealedFile(ctx, rp, cctx.Uint("parallel"), cctx.String("sealing-result"), cctx.String("sealing-temp")); err != nil {
-			return err
-		}
-
-		log.Info("Complete recovery sealed， waiting pc2")
+		log.Info("Sealer recovery has started")
 
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 		<-sigs
-		close(paramChannel)
 
-		log.Info("Complete pc2 sealed")
+		closing = true
+		<-done
+
+		log.Info("Sealer recovery finished")
 
 		return nil
 	},
@@ -205,10 +197,10 @@ func migrateRecoverMeta(ctx context.Context, metadata string) (export.RecoveryPa
 	return rp, nil
 }
 
-func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel uint, sealingResult string, sealingTemp string) error {
+func RecoverPC1SealedFile(ctx context.Context, rp export.RecoveryParams, parallel uint, sealingTemp string) {
 	actorID, err := address.IDFromAddress(rp.Miner)
 	if err != nil {
-		return xerrors.Errorf("Getting IDFromAddress err:", err)
+		log.Panicf("Getting IDFromAddress err:", err)
 	}
 
 	wg := &sync.WaitGroup{}
@@ -216,9 +208,12 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 	var p1LastTaskTime time.Time
 
 	for _, sector := range rp.SectorInfos {
-		key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
-		b, err := db.Has(datastore.NewKey(key))
-		if err != nil {
+		if closing {
+			break
+		}
+
+		b, err := redisDB.HExists(ctx, PC1_RESULT_KEY, sector.SectorNumber.String()).Result()
+		if err != nil && err != redis.Nil {
 			log.Errorf("Sector (%d) , has pc1o error: %v", sector.SectorNumber, err)
 		}
 
@@ -278,7 +273,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 			if !b {
 				log.Infof("Start running AP, sector (%d)", sector.SectorNumber)
 
-				pi, err := sb.AddPiece(context.TODO(), sid, nil, abi.PaddedPieceSize(rp.SectorSize).Unpadded(), sealing.NewNullReader(abi.UnpaddedPieceSize(rp.SectorSize)))
+				pi, err := sb.AddPiece(ctx, sid, nil, abi.PaddedPieceSize(rp.SectorSize).Unpadded(), sealing.NewNullReader(abi.UnpaddedPieceSize(rp.SectorSize)))
 				if err != nil {
 					log.Errorf("Sector (%d) ,running AP  error: %v", sector.SectorNumber, err)
 					return
@@ -290,7 +285,7 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 
 				log.Infof("Start running PreCommit1, sector (%d)", sector.SectorNumber)
 
-				pc1o, err = sb.SealPreCommit1(context.TODO(), sid, abi.SealRandomness(sector.Ticket), []abi.PieceInfo{pi})
+				pc1o, err = sb.SealPreCommit1(ctx, sid, abi.SealRandomness(sector.Ticket), []abi.PieceInfo{pi})
 				if err != nil {
 					log.Errorf("Sector (%d) , running PreCommit1  error: %v", sector.SectorNumber, err)
 					return
@@ -302,110 +297,168 @@ func RecoverSealedFile(ctx context.Context, rp export.RecoveryParams, parallel u
 
 				log.Infof("Complete PreCommit1, sector (%d)", sector.SectorNumber)
 
-				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
-				err = db.Put(datastore.NewKey(key), pc1o)
+				_, err = redisDB.HSet(ctx, PC1_RESULT_KEY, sector.SectorNumber.String(), []byte(pc1o)).Result()
 				if err != nil {
 					log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
 				}
-
 			} else {
-				key := fmt.Sprintf("pc1-%s", sector.SectorNumber.String())
-				pc1o, err = db.Get(datastore.NewKey(key))
+				pc1oStr, err := redisDB.HGet(ctx, PC1_RESULT_KEY, sector.SectorNumber.String()).Result()
 				if err != nil {
 					log.Errorf("Sector (%d) , get pc1o error: %v", sector.SectorNumber, err)
 					return
 				}
+				pc1o = []byte(pc1oStr)
 				log.Infof("Have Completed PreCommit1, sector (%d)", sector.SectorNumber)
 			}
 
 			p := &PreCommitParam{
-				Sb:            sb,
-				Sid:           sid,
-				Phase1Out:     pc1o,
-				SealedCID:     sector.SealedCID.String(),
-				TempDir:       tempDir,
-				SealingResult: sealingResult,
+				SectorInfo: *sector,
+				Phase1Out:  pc1o,
 			}
-			paramChannel <- p
+			pStr, _ := json.Marshal(p)
+			_, err = redisDB.LPush(ctx, QUEUE_KEY, pStr).Result()
+			if err != nil {
+				log.Errorf("Sector (%d) , lpush queue error: %v", sector.SectorNumber, err)
+				return
+			}
 
-			//err = sealPreCommit2AndCheck(ctx, sb, sid, pc1o, sector.SealedCID.String())
-			//if err != nil {
-			//	log.Errorf("Sector (%d) , running PreCommit2  error: %v", sector.SectorNumber, err)
-			//}
-			//
-			//err = MoveStorage(ctx, sid, tempDir, sealingResult)
-			//if err != nil {
-			//	log.Errorf("Sector (%d) , running MoveStorage  error: %v", sector.SectorNumber, err)
-			//}
-			//
-			//key := fmt.Sprintf("pc2-%s", sector.SectorNumber.String())
-			//err = db.Put(datastore.NewKey(key), []byte("success"))
-			//if err != nil {
-			//	log.Errorf("Sector (%d) , put pc2 error: %v", sector.SectorNumber, err)
-			//}
-			//
-			//log.Infof("Complete sector (%d)", sector.SectorNumber)
 		}(sector, b)
 	}
 	wg.Wait()
 
-	return nil
+	done <- true
 }
 
-func HandlePreCommit2() {
+func RecoverPC2SealedFile(ctx context.Context, rp export.RecoveryParams, sealingResult string, sealingTemp string) {
+	actorID, err := address.IDFromAddress(rp.Miner)
+	if err != nil {
+		log.Panicf("Getting IDFromAddress err:", err)
+	}
+
+	//处理重启的情况
+	content, err := redisDB.HGetAll(ctx, PC2_COMPUTING_TMEP_KEY).Result()
+	if err != nil && err != redis.Nil {
+		log.Panicf("Redis hgetall temp: %v", err)
+	}
+	for _, value := range content {
+		HandlePreCommit2(ctx, actorID, sealingTemp, sealingResult, value)
+	}
+
+	//接收队列
 	for {
-		select {
-		case p := <-paramChannel:
-			number := p.Sid.ID.Number
+		if closing {
+			break
+		}
 
-			log.Infof("Start running PreCommit2, sector (%d)", number)
-			ctx := context.Background()
+		valueSlice, err := redisDB.BRPop(ctx, 5*time.Second, QUEUE_KEY).Result()
+		if err == redis.Nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		if err != nil {
+			time.Sleep(time.Second)
+			log.Errorf("Redis brpop: %v", err)
+			continue
+		}
 
-			//err := sealPreCommit2AndCheck(ctx, p.Sb, p.Sid, p.Phase1Out, p.SealedCID)
-			//if err != nil {
-			//	log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
-			//	continue
-			//}
-
-			cids, err := p.Sb.SealPreCommit2(ctx, p.Sid, p.Phase1Out)
-			if err != nil {
-				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
-				_ = os.RemoveAll(p.TempDir)
-				WriteErrorSector(p.Sid.ID.Number.String(), err.Error())
-				continue
-			}
-
-			if cids.Sealed.String() == "" {
-				//restart
-				continue
-			}
-
-			log.Infof("Complete PreCommit2, sector (%d)", p.Sid.ID)
-
-			//check CID with chain
-			if p.SealedCID != cids.Sealed.String() {
-				err := xerrors.Errorf("sealed cid mismatching!!! (sealedCID: %v, newSealedCID: %v)", p.SealedCID, cids.Sealed.String())
-				log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
-				_ = os.RemoveAll(p.TempDir)
-				WriteErrorSector(p.Sid.ID.Number.String(), "mismatching")
-				continue
-			}
-
-			err = MoveStorage(ctx, p.Sid, p.TempDir, p.SealingResult)
-			if err != nil {
-				log.Errorf("Sector (%d) , running MoveStorage  error: %v", number, err)
-				continue
-			}
-
-			key := fmt.Sprintf("pc2-%s", number.String())
-			err = db.Put(datastore.NewKey(key), []byte("success"))
-			if err != nil {
-				log.Errorf("Sector (%d) , put pc2 error: %v", number, err)
-			}
-
-			log.Infof("Complete PreCommit2, sector (%d)", number)
+		for _, value := range valueSlice {
+			HandlePreCommit2(ctx, actorID, sealingTemp, sealingResult, value)
 		}
 	}
+
+	done <- true
+}
+
+func HandlePreCommit2(ctx context.Context, actorID uint64, sealingTemp, sealingResult string, value string) {
+	var preCommitParam PreCommitParam
+	json.Unmarshal([]byte(value), &preCommitParam)
+
+	//记录正在处理的
+	_, err := redisDB.HSet(ctx, PC2_COMPUTING_TMEP_KEY, preCommitParam.SectorInfo.SectorNumber.String(), value).Result()
+	if err != nil {
+		log.Errorf("Redis hset temp: %v", err)
+	}
+
+	HandleOnePreCommit2(ctx, actorID, &preCommitParam.SectorInfo, sealingTemp, sealingResult, preCommitParam.Phase1Out)
+
+	//删除正在处理的
+	_, err = redisDB.HDel(ctx, PC2_COMPUTING_TMEP_KEY, preCommitParam.SectorInfo.SectorNumber.String()).Result()
+	if err != nil {
+		log.Errorf("Redis hdel temp: %v", err)
+	}
+}
+
+func HandleOnePreCommit2(ctx context.Context, actorID uint64, sector *export.SectorInfo, sealingTemp, sealingResult string, phase1Out storage.PreCommit1Out) {
+	number := sector.SectorNumber
+	log.Infof("Start running PreCommit2, sector (%d)", number)
+
+	sdir, err := homedir.Expand(sealingTemp)
+	if err != nil {
+		log.Errorf("Sector (%d) ,expands the path error: %v", number, err)
+		return
+	}
+	mkdirAll(sdir)
+	//tempDir, err := ioutil.TempDir(sdir, fmt.Sprintf("recover-%d", sector.SectorNumber))
+	tempDir := path.Join(sdir, fmt.Sprintf("recover-%d", number))
+	if err != nil {
+		log.Errorf("Sector (%d) ,creates a new temporary directory error: %v", number, err)
+		return
+	}
+	if err := os.MkdirAll(tempDir, 0775); err != nil {
+		log.Errorf("Sector (%d) ,creates a directory named path error: %v", number, err)
+		return
+	}
+	sb, err := ffiwrapper.New(&basicfs.Provider{
+		Root: tempDir,
+	})
+	if err != nil {
+		log.Errorf("Sector (%d) ,new ffi Sealer error: %v", sector.SectorNumber, err)
+		return
+	}
+
+	sid := storage.SectorRef{
+		ID: abi.SectorID{
+			Miner:  abi.ActorID(actorID),
+			Number: sector.SectorNumber,
+		},
+		ProofType: sector.SealProof,
+	}
+
+	cids, err := sb.SealPreCommit2(ctx, sid, phase1Out)
+	if err != nil {
+		log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+		_ = os.RemoveAll(tempDir)
+		WriteErrorSector(number.String(), err.Error())
+		return
+	}
+
+	if cids.Sealed.String() == "" {
+		return
+	}
+
+	log.Infof("Complete PreCommit2, sector (%d)", number)
+
+	//check CID with chain
+	if sector.SealedCID.String() != cids.Sealed.String() {
+		err := xerrors.Errorf("sealed cid mismatching!!! (sealedCID: %v, newSealedCID: %v)", sector.SealedCID.String(), cids.Sealed.String())
+		log.Errorf("Sector (%d) , running PreCommit2  error: %v", number, err)
+		_ = os.RemoveAll(tempDir)
+		WriteErrorSector(number.String(), "mismatching")
+		return
+	}
+
+	err = MoveStorage(ctx, sid, tempDir, sealingResult)
+	if err != nil {
+		log.Errorf("Sector (%d) , running MoveStorage  error: %v", number, err)
+		return
+	}
+
+	_, err = redisDB.HSet(ctx, PC2_RESULT_KEY, number.String(), []byte("success")).Result()
+	if err != nil {
+		log.Errorf("Sector (%d) , put pc2 error: %v", number, err)
+	}
+
+	log.Infof("Complete PreCommit2, sector (%d)", number)
 }
 
 func WriteErrorSector(sectorId string, reason string) {
