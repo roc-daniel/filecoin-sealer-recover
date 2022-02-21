@@ -300,6 +300,7 @@ func RecoverPC1SealedFile(ctx context.Context, rp export.RecoveryParams, paralle
 				_, err = redisDB.HSet(ctx, PC1_RESULT_KEY, sector.SectorNumber.String(), []byte(pc1o)).Result()
 				if err != nil {
 					log.Errorf("Sector (%d) , put pc1o error: %v", sector.SectorNumber, err)
+					return
 				}
 			} else {
 				pc1oStr, err := redisDB.HGet(ctx, PC1_RESULT_KEY, sector.SectorNumber.String()).Result()
@@ -456,6 +457,7 @@ func HandleOnePreCommit2(ctx context.Context, actorID uint64, sector *export.Sec
 	_, err = redisDB.HSet(ctx, PC2_RESULT_KEY, number.String(), []byte("success")).Result()
 	if err != nil {
 		log.Errorf("Sector (%d) , put pc2 error: %v", number, err)
+		return
 	}
 
 	log.Infof("Complete PreCommit2, sector (%d)", number)
