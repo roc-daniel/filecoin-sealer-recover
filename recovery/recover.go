@@ -358,12 +358,12 @@ func RecoverPC2SealedFile(ctx context.Context, rp export.RecoveryParams, sealing
 		}
 		if err != nil {
 			time.Sleep(time.Second)
-			log.Errorf("Redis brpop: %v", err)
+			log.Errorf("Loop redis brpop: %v", err)
 			continue
 		}
 
-		for _, value := range valueSlice {
-			HandlePreCommit2(ctx, actorID, sealingTemp, sealingResult, value)
+		if len(valueSlice) == 2 {
+			HandlePreCommit2(ctx, actorID, sealingTemp, sealingResult, valueSlice[1])
 		}
 	}
 
@@ -377,7 +377,7 @@ func HandlePreCommit2(ctx context.Context, actorID uint64, sealingTemp, sealingR
 	//记录正在处理的
 	_, err := redisDB.HSet(ctx, PC2_COMPUTING_TMEP_KEY, preCommitParam.SectorInfo.SectorNumber.String(), value).Result()
 	if err != nil {
-		log.Errorf("Redis hset temp: %v", err)
+		log.Errorf("Sector (%d), Redis hset temp: %v", preCommitParam.SectorInfo.SectorNumber, err)
 	}
 
 	HandleOnePreCommit2(ctx, actorID, &preCommitParam.SectorInfo, sealingTemp, sealingResult, preCommitParam.Phase1Out)
@@ -385,7 +385,7 @@ func HandlePreCommit2(ctx context.Context, actorID uint64, sealingTemp, sealingR
 	//删除正在处理的
 	_, err = redisDB.HDel(ctx, PC2_COMPUTING_TMEP_KEY, preCommitParam.SectorInfo.SectorNumber.String()).Result()
 	if err != nil {
-		log.Errorf("Redis hdel temp: %v", err)
+		log.Errorf("Sector (%d), Redis hdel temp: %v", err)
 	}
 }
 
