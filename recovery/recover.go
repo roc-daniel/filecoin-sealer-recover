@@ -146,8 +146,9 @@ var RecoverCmd = &cli.Command{
 			rp.SectorInfos = sectorInfos
 
 			go RecoverPC1SealedFile(ctx, rp, cctx.Uint("parallel"), cctx.String("sealing-temp"))
+		}
 
-		} else if cctx.Bool("precommit2") {
+		if cctx.Bool("precommit2") {
 			errorSector, err := homedir.Expand("error-sector.txt")
 			if err != nil {
 				return xerrors.Errorf("get homedir: %v", err)
